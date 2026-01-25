@@ -1,0 +1,33 @@
+version: "3.8"
+
+# Usage Tracking PostgreSQL
+# Use this if you DON'T have an existing PostgreSQL instance
+# If using LangGraph Memory Filter's PostgreSQL, just run init-postgres.sql against that
+
+services:
+  usage-postgres:
+    image: postgres:16-alpine
+    container_name: usage-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: usage_tracker
+      POSTGRES_PASSWORD: usage_password_change_me
+      POSTGRES_DB: usage_tracking
+    ports:
+      - "5433:5432" # Different port to avoid conflicts with other PostgreSQL
+    volumes:
+      - usage_postgres_data:/var/lib/postgresql/data
+      - ./init-postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U usage_tracker -d usage_tracking"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  usage_postgres_data:
+
+networks:
+  default:
+    name: openwebui-network
+    external: true
