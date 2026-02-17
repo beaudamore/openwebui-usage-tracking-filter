@@ -25,7 +25,7 @@ cd docker
 docker-compose -f docker-compose.usage.yml up -d
 ```
 
-> **Note:** The `docker/init-postgres.sql` file is kept for reference and manual schema management, but is not required for normal operation.
+> **Note:** The filter auto-creates all required tables, indexes, views, and default tiers on first run — no manual SQL setup is needed.
 
 ### Step 2: Install Dependencies
 
