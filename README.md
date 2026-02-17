@@ -26,8 +26,7 @@ openwebui-usage-tracking-filter/
 │   ├── usage_tracking_filter.py      # Main filter code
 │   └── requirements.txt              # Python dependencies
 ├── docker/
-│   ├── docker-compose.usage.yml      # PostgreSQL container (or use existing)
-│   └── init-postgres.sql             # Schema reference (auto-created by filter)
+│   └── docker-compose.usage.yml      # PostgreSQL container (or use existing)
 └── docs/
     ├── SETUP.md                      # Full installation guide
     └── ADMIN_GUIDE.md                # Managing users and groups
