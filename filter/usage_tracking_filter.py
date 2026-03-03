@@ -131,8 +131,8 @@ class Filter:
         -- ============================================================================
         CREATE TABLE IF NOT EXISTS usage_limits (
             group_name VARCHAR(50) PRIMARY KEY,
-            daily_token_limit BIGINT NOT NULL DEFAULT 50000,
-            monthly_token_limit BIGINT NOT NULL DEFAULT 1000000,
+            daily_token_limit BIGINT NOT NULL DEFAULT 1000000,
+            monthly_token_limit BIGINT NOT NULL DEFAULT 10000000,
             rate_limit_rpm INT,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -142,8 +142,8 @@ class Filter:
         -- Insert default tiers (skip if already exist)
         INSERT INTO usage_limits (group_name, daily_token_limit, monthly_token_limit, description)
         VALUES 
-            ('freemium', 50000, 1000000, 'Free tier - 50k/day, 1M/month'),
-            ('pro', 500000, 10000000, 'Pro tier - 500k/day, 10M/month'),
+            ('freemium', 1000000, 10000000, 'Free tier - 1M/day, 10M/month'),
+            ('pro', 5000000, 100000000, 'Pro tier - 5M/day, 100M/month'),
             ('enterprise', -1, -1, 'Enterprise tier - unlimited (-1 = no limit)')
         ON CONFLICT (group_name) DO NOTHING;
 
@@ -267,17 +267,17 @@ class Filter:
             RETURN QUERY
             SELECT 
                 COALESCE(ug.group_name, 'freemium')::VARCHAR(50) as group_name,
-                COALESCE(ul.daily_token_limit, 50000) as daily_limit,
-                COALESCE(ul.monthly_token_limit, 1000000) as monthly_limit,
+                COALESCE(ul.daily_token_limit, 1000000) as daily_limit,
+                COALESCE(ul.monthly_token_limit, 10000000) as monthly_limit,
                 COALESCE(daily.total, 0) as tokens_today,
                 COALESCE(monthly.total, 0) as tokens_this_month,
                 CASE 
-                    WHEN COALESCE(ul.daily_token_limit, 50000) = -1 THEN FALSE
-                    ELSE COALESCE(daily.total, 0) >= COALESCE(ul.daily_token_limit, 50000)
+                    WHEN COALESCE(ul.daily_token_limit, 1000000) = -1 THEN FALSE
+                    ELSE COALESCE(daily.total, 0) >= COALESCE(ul.daily_token_limit, 1000000)
                 END as is_over_daily,
                 CASE 
-                    WHEN COALESCE(ul.monthly_token_limit, 1000000) = -1 THEN FALSE
-                    ELSE COALESCE(monthly.total, 0) >= COALESCE(ul.monthly_token_limit, 1000000)
+                    WHEN COALESCE(ul.monthly_token_limit, 10000000) = -1 THEN FALSE
+                    ELSE COALESCE(monthly.total, 0) >= COALESCE(ul.monthly_token_limit, 10000000)
                 END as is_over_monthly
             FROM (SELECT p_user_id as user_id) u
             LEFT JOIN user_groups ug ON u.user_id = ug.user_id
@@ -421,8 +421,8 @@ class Filter:
                     # Fallback: user not found, return defaults
                     return {
                         "group_name": self.valves.default_group,
-                        "daily_limit": 50000,
-                        "monthly_limit": 1000000,
+                        "daily_limit": 1000000,
+                        "monthly_limit": 10000000,
                         "tokens_today": 0,
                         "tokens_this_month": 0,
                         "is_over_daily": False,
