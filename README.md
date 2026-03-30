@@ -1,5 +1,11 @@
 # Usage Tracking Filter for Open WebUI
 
+![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
+![OpenWebUI](https://img.shields.io/badge/Open_WebUI-Filter-green)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Backend-blue?logo=postgresql&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-yellow)
+![Zero PII](https://img.shields.io/badge/Zero_PII-Storage-brightgreen)
+
 A token usage tracking and rate limiting system for [Open WebUI](https://github.com/open-webui/open-webui) with group-based quotas and PostgreSQL persistence.
 
 ## Author
