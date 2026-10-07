@@ -1,8 +1,8 @@
 """
 title: Usage Tracking Filter
 author: beaudamore
-date: 2026-01-24
-version: 1.0.0
+date: 2026-10-07
+version: 1.0.1
 license: MIT
 description: Token usage tracking and group-based rate limiting with PostgreSQL persistence
 required_open_webui_version: >= 0.5.0
@@ -11,6 +11,7 @@ requirements: psycopg[binary], psycopg-pool
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -26,6 +27,10 @@ import psycopg_pool
 # Set up logging
 logger = logging.getLogger("openwebui.filters.usage_tracking")
 logger.setLevel(logging.INFO)
+
+
+class UsageLimitExceeded(Exception):
+    """Raised from inlet to stop the request. Open WebUI shows the message to the user."""
 
 
 class Filter:
@@ -74,7 +79,7 @@ class Filter:
         # Default Group
         default_group: str = Field(
             default="freemium",
-            description="Default group for users not in user_groups table"
+            description="Tier applied to users with no row in user_groups. Must match a group_name in usage_limits; new users are auto-enrolled into it on their first recorded response."
         )
         
         # Behavior Configuration
@@ -104,10 +109,10 @@ class Filter:
         )
 
     class UserValves(BaseModel):
-        """Per-user configuration"""
-        enabled: bool = Field(
+        """Per-user configuration (users can change these themselves, so nothing here may weaken enforcement)"""
+        show_usage_status: bool = Field(
             default=True,
-            description="Enable usage tracking for this user"
+            description="Show the usage status line on your messages. Limit warnings and blocking are unaffected."
         )
 
     def __init__(self):
@@ -115,7 +120,8 @@ class Filter:
         self.valves = self.Valves()
         self._pool = None
         self._initialized = False
-        
+        self._init_lock = asyncio.Lock()
+
     def _log(self, message: str, level: str = "info"):
         """Centralized logging"""
         if level == "debug" and not self.valves.debug_mode:
@@ -123,8 +129,16 @@ class Filter:
         print(f"[Usage Tracking] [{level.upper()}] {message}", flush=True)
         getattr(logger, level, logger.info)(f"[Usage Tracking] {message}")
 
-    def _get_schema_sql(self) -> str:
-        """Return the complete schema SQL for auto-creation"""
+    @staticmethod
+    def _user_wants_status(__user__: Optional[Dict[str, Any]]) -> bool:
+        """Read the per-user show_usage_status valve. Open WebUI injects it as __user__["valves"]."""
+        user_valves = (__user__ or {}).get("valves")
+        if user_valves is None:
+            return True
+        return bool(getattr(user_valves, "show_usage_status", True))
+
+    def _get_tables_sql(self) -> str:
+        """Tables, indexes and seed tiers. Run only when the schema is missing, so admin edits to tiers survive restarts."""
         return """
         -- ============================================================================
         -- USAGE LIMITS: Group-based quota definitions
@@ -181,7 +195,11 @@ class Filter:
         CREATE INDEX IF NOT EXISTS idx_usage_records_date ON usage_records(recorded_at);
         CREATE INDEX IF NOT EXISTS idx_usage_records_user_date ON usage_records(user_id, recorded_at DESC);
         -- Note: Cannot use DATE(recorded_at) in index - not immutable. Use recorded_at::date in queries instead.
+        """
 
+    def _get_routines_sql(self) -> str:
+        """Views and functions. Idempotent; re-applied on every initialization so upgrades need no manual migration."""
+        return """
         -- ============================================================================
         -- VIEWS: Convenient queries for common operations
         -- ============================================================================
@@ -252,8 +270,16 @@ class Filter:
         -- FUNCTIONS: Helper functions for the filter
         -- ============================================================================
 
-        -- Get user's current limits and usage in one call
-        CREATE OR REPLACE FUNCTION get_user_usage_status(p_user_id VARCHAR(255))
+        -- Drop pre-1.0.1 signatures so the versions below replace them instead of overloading them
+        DROP FUNCTION IF EXISTS get_user_usage_status(VARCHAR);
+        DROP FUNCTION IF EXISTS record_usage(VARCHAR, INT, INT, VARCHAR, VARCHAR, VARCHAR);
+
+        -- Get user's current limits and usage in one call.
+        -- p_default_group: tier assumed for users with no user_groups row (the default_group valve).
+        CREATE OR REPLACE FUNCTION get_user_usage_status(
+            p_user_id VARCHAR(255),
+            p_default_group VARCHAR(50) DEFAULT 'freemium'
+        )
         RETURNS TABLE (
             group_name VARCHAR(50),
             daily_limit BIGINT,
@@ -266,7 +292,7 @@ class Filter:
         BEGIN
             RETURN QUERY
             SELECT 
-                COALESCE(ug.group_name, 'freemium')::VARCHAR(50) as group_name,
+                COALESCE(ug.group_name, p_default_group)::VARCHAR(50) as group_name,
                 COALESCE(ul.daily_token_limit, 1000000) as daily_limit,
                 COALESCE(ul.monthly_token_limit, 10000000) as monthly_limit,
                 COALESCE(daily.total, 0) as tokens_today,
@@ -281,7 +307,7 @@ class Filter:
                 END as is_over_monthly
             FROM (SELECT p_user_id as user_id) u
             LEFT JOIN user_groups ug ON u.user_id = ug.user_id
-            LEFT JOIN usage_limits ul ON COALESCE(ug.group_name, 'freemium') = ul.group_name
+            LEFT JOIN usage_limits ul ON COALESCE(ug.group_name, p_default_group) = ul.group_name
             LEFT JOIN (
                 SELECT ur.user_id, SUM(ur.total_tokens)::BIGINT as total
                 FROM usage_records ur
@@ -297,22 +323,27 @@ class Filter:
         END;
         $$ LANGUAGE plpgsql;
 
-        -- Record usage (simple insert wrapper)
+        -- Record usage (simple insert wrapper).
+        -- p_default_group: tier new users are enrolled into (the default_group valve).
         CREATE OR REPLACE FUNCTION record_usage(
             p_user_id VARCHAR(255),
             p_prompt_tokens INT,
             p_completion_tokens INT,
             p_model_id VARCHAR(255) DEFAULT NULL,
             p_pipeline_id VARCHAR(255) DEFAULT NULL,
-            p_chat_id VARCHAR(255) DEFAULT NULL
+            p_chat_id VARCHAR(255) DEFAULT NULL,
+            p_default_group VARCHAR(50) DEFAULT 'freemium'
         ) RETURNS VOID AS $$
         BEGIN
             INSERT INTO usage_records (user_id, prompt_tokens, completion_tokens, total_tokens, model_id, pipeline_id, chat_id)
             VALUES (p_user_id, p_prompt_tokens, p_completion_tokens, p_prompt_tokens + p_completion_tokens, p_model_id, p_pipeline_id, p_chat_id);
-            
-            -- Auto-create user in freemium group if not exists
+
+            -- Auto-enrol the user in the default tier if they have no row yet.
+            -- Guarded by EXISTS so a default_group that names a missing tier cannot
+            -- violate the foreign key and abort the usage insert above.
             INSERT INTO user_groups (user_id, group_name)
-            VALUES (p_user_id, 'freemium')
+            SELECT p_user_id, p_default_group
+            WHERE EXISTS (SELECT 1 FROM usage_limits WHERE group_name = p_default_group)
             ON CONFLICT (user_id) DO NOTHING;
         END;
         $$ LANGUAGE plpgsql;
@@ -333,70 +364,85 @@ class Filter:
 
     def _ensure_schema(self, conn) -> bool:
         """
-        Check if schema exists and create if not.
-        Returns True if schema was created, False if it already existed.
+        Create tables on first run; (re)apply views and functions on every run.
+        Returns True if the tables were created, False if they already existed.
         """
         with conn.cursor() as cur:
             # Check if main table exists
             cur.execute("""
                 SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
+                    SELECT FROM information_schema.tables
                     WHERE table_name = 'usage_limits'
                 )
             """)
             tables_exist = cur.fetchone()[0]
-            
+
             if tables_exist:
                 self._log("Usage tracking tables already exist", "debug")
-                return False
-            
-            # Tables don't exist - create the entire schema
-            self._log("Creating usage tracking schema...")
-            
-            schema_sql = self._get_schema_sql()
-            cur.execute(schema_sql)
+            else:
+                self._log("Creating usage tracking tables...")
+                cur.execute(self._get_tables_sql())
+
+            # Views and functions are idempotent and cheap; always apply so that
+            # upgrades of this filter take effect without manual migration.
+            cur.execute(self._get_routines_sql())
             conn.commit()
-            
-            self._log("✅ Usage tracking schema created successfully")
-            return True
+
+            if not tables_exist:
+                self._log("✅ Usage tracking schema created successfully")
+
+            # Warn if the configured default tier does not exist
+            cur.execute("SELECT 1 FROM usage_limits WHERE group_name = %s", (self.valves.default_group,))
+            if cur.fetchone() is None:
+                self._log(
+                    f"default_group '{self.valves.default_group}' is not defined in usage_limits. "
+                    f"Unassigned users get fallback limits (1M/day, 10M/month) and will not be auto-enrolled.",
+                    "warning",
+                )
+
+            return not tables_exist
+
+    def _connect(self):
+        """Blocking: open the connection pool and ensure the schema. Runs in a worker thread."""
+        conn_string = (
+            f"postgresql://{self.valves.postgres_user}:"
+            f"{quote_plus(self.valves.postgres_password)}@"
+            f"{self.valves.postgres_host}:{self.valves.postgres_port}/"
+            f"{self.valves.postgres_database}"
+        )
+
+        self._log(f"Connecting to PostgreSQL at {self.valves.postgres_host}:{self.valves.postgres_port}")
+
+        pool = psycopg_pool.ConnectionPool(
+            conninfo=conn_string,
+            min_size=1,
+            max_size=5,
+            open=True,
+        )
+
+        with pool.connection() as conn:
+            if self._ensure_schema(conn):
+                self._log("Schema was auto-created on first run")
+            else:
+                self._log("Using existing schema", "debug")
+
+        return pool
 
     async def _initialize(self):
-        """Initialize PostgreSQL connection pool and ensure schema exists"""
+        """Initialize PostgreSQL connection pool and ensure schema exists (once, without blocking the event loop)"""
         if self._initialized:
             return
-            
-        try:
-            conn_string = (
-                f"postgresql://{self.valves.postgres_user}:"
-                f"{quote_plus(self.valves.postgres_password)}@"
-                f"{self.valves.postgres_host}:{self.valves.postgres_port}/"
-                f"{self.valves.postgres_database}"
-            )
-            
-            self._log(f"Connecting to PostgreSQL at {self.valves.postgres_host}:{self.valves.postgres_port}")
-            
-            # Create connection pool
-            self._pool = psycopg_pool.ConnectionPool(
-                conninfo=conn_string,
-                min_size=1,
-                max_size=5,
-                open=True,
-            )
-            
-            # Ensure schema exists (auto-create if needed)
-            with self._pool.connection() as conn:
-                schema_created = self._ensure_schema(conn)
-                if schema_created:
-                    self._log("Schema was auto-created on first run")
-                else:
-                    self._log("Using existing schema", "debug")
-            
-            self._initialized = True
-            self._log("Usage tracking initialized successfully")
-            
-        except Exception as e:
-            self._log(f"Failed to initialize: {e}", "error")
-            raise
+
+        async with self._init_lock:
+            if self._initialized:
+                return
+            try:
+                self._pool = await asyncio.to_thread(self._connect)
+                self._initialized = True
+                self._log("Usage tracking initialized successfully")
+            except Exception as e:
+                self._log(f"Failed to initialize: {e}", "error")
+                raise
 
     def _get_user_status(self, user_id: str) -> Dict[str, Any]:
         """Get user's current usage status from PostgreSQL"""
@@ -404,7 +450,10 @@ class Filter:
             with self._pool.connection() as conn:
                 with conn.cursor() as cur:
                     # Use the helper function we created
-                    cur.execute("SELECT * FROM get_user_usage_status(%s)", (user_id,))
+                    cur.execute(
+                        "SELECT * FROM get_user_usage_status(%s, %s)",
+                        (user_id, self.valves.default_group),
+                    )
                     row = cur.fetchone()
                     
                     if row:
@@ -456,8 +505,9 @@ class Filter:
             with self._pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT record_usage(%s, %s, %s, %s, %s, %s)",
-                        (user_id, prompt_tokens, completion_tokens, model_id, pipeline_id, chat_id)
+                        "SELECT record_usage(%s, %s, %s, %s, %s, %s, %s)",
+                        (user_id, prompt_tokens, completion_tokens, model_id, pipeline_id, chat_id,
+                         self.valves.default_group)
                     )
                 conn.commit()
                 
@@ -493,17 +543,17 @@ class Filter:
                 await self._initialize()
             
             # Get user's current status (always, for all users including admins)
-            status = self._get_user_status(user_id)
-            
+            status = await asyncio.to_thread(self._get_user_status, user_id)
+
             self._log(
                 f"User {user_id[:8]}... ({status['group_name']}): "
                 f"{status['tokens_today']}/{status['daily_limit']} today, "
                 f"{status['tokens_this_month']}/{status['monthly_limit']} this month",
                 "debug"
             )
-            
-            # Always show current usage status
-            if self.valves.show_usage_status and __event_emitter__:
+
+            # Show current usage status unless disabled globally or by this user
+            if self.valves.show_usage_status and self._user_wants_status(__user__) and __event_emitter__:
                 daily_percent = 0 if status["daily_limit"] == -1 else (status["tokens_today"] / status["daily_limit"] * 100)
                 monthly_percent = 0 if status["monthly_limit"] == -1 else (status["tokens_this_month"] / status["monthly_limit"] * 100)
                 
@@ -522,7 +572,7 @@ class Filter:
                     "type": "status",
                     "data": {
                         "description": f"{icon} Usage: {tokens_today}/{daily_limit} today ({daily_percent:.0f}%) • {tokens_month}/{monthly_limit} month ({monthly_percent:.0f}%)",
-                        "done": False
+                        "done": True
                     }
                 })
             
@@ -561,19 +611,15 @@ class Filter:
                             }
                         })
                     
-                    # Return error in body to stop processing
-                    # This modifies the messages to return the error instead
-                    body["messages"] = [{"role": "assistant", "content": error_msg}]
-                    body["_usage_blocked"] = True
-                    return body
+                    # Raising stops the request; Open WebUI returns the message as a chat error
+                    raise UsageLimitExceeded(error_msg)
                 elif is_admin:
                     self._log(f"Admin user {user_id[:8]}... over limit but bypassing block", "debug")
                 else:
                     self._log(f"User {user_id[:8]}... over limit but blocking disabled", "warning")
-            
-            # Store user_id for outlet
-            body["_usage_user_id"] = user_id
-            
+
+        except UsageLimitExceeded:
+            raise
         except Exception as e:
             self._log(f"Inlet error: {e}", "error")
             # Fail open - allow request on error
@@ -592,17 +638,10 @@ class Filter:
         Outlet: Record token usage from the response
         """
         self._log("=== OUTLET START ===", "debug")
-        
-        # Skip if request was blocked
-        if body.get("_usage_blocked"):
-            self._log("Request was blocked, skipping usage recording", "debug")
-            return body
-        
-        # Get user ID (from inlet or from __user__)
-        user_id = body.pop("_usage_user_id", None)
-        if not user_id and __user__:
-            user_id = __user__.get("id")
-        
+
+        # Outlet body is built fresh by Open WebUI; nothing from inlet survives
+        user_id = __user__.get("id") if __user__ else None
+
         if not user_id:
             self._log("No user ID in outlet, skipping", "debug")
             return body
@@ -627,23 +666,37 @@ class Filter:
                     break
             
             if usage:
-                prompt_tokens = usage.get("prompt_tokens", 0) or usage.get("prompt_eval_count", 0) or 0
-                completion_tokens = usage.get("completion_tokens", 0) or usage.get("eval_count", 0) or 0
+                # Open WebUI normalizes usage: input_tokens/output_tokens are cumulative across
+                # tool-call round trips, while prompt_tokens/completion_tokens hold only the last call.
+                prompt_tokens = (
+                    usage.get("input_tokens", 0)
+                    or usage.get("prompt_tokens", 0)
+                    or usage.get("prompt_eval_count", 0)
+                    or 0
+                )
+                completion_tokens = (
+                    usage.get("output_tokens", 0)
+                    or usage.get("completion_tokens", 0)
+                    or usage.get("eval_count", 0)
+                    or 0
+                )
                 
                 if prompt_tokens > 0 or completion_tokens > 0:
-                    self._record_usage(
-                        user_id=user_id,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        model_id=body.get("model"),
-                        chat_id=body.get("chat_id"),
+                    await asyncio.to_thread(
+                        self._record_usage,
+                        user_id,
+                        prompt_tokens,
+                        completion_tokens,
+                        body.get("model"),
+                        None,
+                        body.get("chat_id"),
                     )
-                    
+
                     total = prompt_tokens + completion_tokens
                     self._log(f"Recorded {total} tokens for user {user_id[:8]}...", "info")
-                    
+
                     # Check if user has now exceeded limits after this usage
-                    status = self._get_user_status(user_id)
+                    status = await asyncio.to_thread(self._get_user_status, user_id)
                     daily_percent = 0 if status["daily_limit"] == -1 else (status["tokens_today"] / status["daily_limit"] * 100)
                     monthly_percent = 0 if status["monthly_limit"] == -1 else (status["tokens_this_month"] / status["monthly_limit"] * 100)
                     
